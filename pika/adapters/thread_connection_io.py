@@ -2,6 +2,7 @@
 from Queue import Queue
 
 from pika import exceptions
+from pika.compat import dict_iteritems
 
 
 class ThreadConnectionIO(object):
@@ -9,7 +10,7 @@ class ThreadConnectionIO(object):
         self.connection = connection
         self.queue = Queue()
 
-    def rpc(self, channel_number, method, acceptable_replies=None):
+    def rpc0(self, channel_number, method, acceptable_replies=None):
         if not isinstance(acceptable_replies, (type(None), list)):
             raise TypeError("acceptable_replies should be list or None")
         self.connection.send_method(channel_number, method)
@@ -20,14 +21,14 @@ class ThreadConnectionIO(object):
             arguments = None
             if isinstance(expect_reply, tuple):
                 expect_reply, arguments = expect_reply
-            if isinstance(response, expect_reply):
-                return self._match_instacne_arg(response, arguments)
+            if isinstance(response, expect_reply) and self._match_instacne_arg(response, arguments):
+                return response
         raise exceptions.UnexpectedFrameError(response)
 
     def _match_instacne_arg(self, response, arguments):
         if arguments is None:
             return True
-        for arg_key, arg_val in arguments:
+        for arg_key, arg_val in dict_iteritems(arguments):
             if not hasattr(response, arg_key) or getattr(response, arg_key) != arg_val:
                 return False
         return True

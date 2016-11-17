@@ -16,16 +16,20 @@ LOGGER = logging.getLogger(__name__)
 
 
 class CloseableThread(threading.Thread):
-    def __init__(self):
-        super(CloseableThread, self).__init__()
+    def __init__(self, name):
+        super(CloseableThread, self).__init__(name=name)
         self._stop = threading.Event()
+        self.daemon = True
 
     def stop(self):
         self._stop.set()
 
     def run(self):
         while not self._stop.isSet():
-            self._run0()
+            try:
+                self._run0()
+            except Exception as e:
+                LOGGER.error(e)
 
     def _run0(self):
         raise NotImplementedError
@@ -33,11 +37,10 @@ class CloseableThread(threading.Thread):
 
 class HeartbeatSender(CloseableThread):
     def __init__(self, connection):
-        super(HeartbeatSender, self).__init__()
+        super(HeartbeatSender, self).__init__("HeartbeatThread")
         self._connection = connection
         self.last_activity_time = 0
         self.heartbeat = 0
-        self.daemon = True
 
     def _run0(self):
         self._send_heartbeat_frame()
@@ -57,7 +60,7 @@ class HeartbeatSender(CloseableThread):
 
 class ThreadConnectionMainLoop(CloseableThread):
     def __init__(self, connection):
-        super(ThreadConnectionMainLoop, self).__init__()
+        super(ThreadConnectionMainLoop, self).__init__("MainLoop")
         self._connection = connection
 
     def _run0(self):
@@ -65,6 +68,10 @@ class ThreadConnectionMainLoop(CloseableThread):
         _consumed_count, frame_value = frame.decode_frame(read_frame_buffer)
         if isinstance(frame_value, frame.Heartbeat):
             LOGGER.debug("receive heartbeat")
+        elif isinstance(frame_value, frame.Method) and (isinstance(frame_value.method, spec.Basic.Ack) or
+                                                            isinstance(frame_value.method, spec.Basic.Ack)):
+            # for In publisher-acknowledgments mode
+            self._connection.deliver_pub_ack(frame_value)
         else:
             self._connection.deliver_frame(frame_value)
 
@@ -108,22 +115,21 @@ class ThreadConnection(ThreadConnectionIO):
         self._heartbeat.start()
 
     def _handshake(self):
-        connection_start = self.rpc(self.channel_number0, frame.ProtocolHeader(), [spec.Connection.Start])
+        connection_start = self.rpc0(self.channel_number0, frame.ProtocolHeader(), [spec.Connection.Start])
         self.server_properties = connection_start.server_properties
         self.publisher_confirms = self.server_properties['capabilities']['publisher_confirms']
         self.basic_nack = self.server_properties['capabilities']['basic.nack']
         (auth_type, response) = self.parameters.credentials.response_for(connection_start)
-        tune = self.rpc(self.channel_number0, spec.Connection.StartOk(self.client_properties, auth_type, response,
-                                                                      self.parameters.locale), [spec.Connection.Tune])
+        tune = self.rpc0(self.channel_number0, spec.Connection.StartOk(self.client_properties, auth_type, response,
+                                                                       self.parameters.locale), [spec.Connection.Tune])
         self.channel_max = tune.channel_max or self.parameters.channel_max
         self.frame_max = tune.frame_max or self.parameters.frame_max
         self.heartbeat = min(tune.heartbeat, self.parameters.heartbeat)
 
         self.send_method(self.channel_number0, spec.Connection.TuneOk(self.channel_max, self.frame_max,
                                                                       self.heartbeat))
-        connection_open = self.rpc(self.channel_number0, spec.Connection.Open(self.parameters.virtual_host, '', False),
-                                   [spec.Connection.OpenOk])
-        print connection_open
+        self.rpc0(self.channel_number0, spec.Connection.Open(self.parameters.virtual_host, '', False),
+                  [spec.Connection.OpenOk])
 
     def channel(self, channel_number=None):
         if channel_number is None:
@@ -131,6 +137,13 @@ class ThreadConnection(ThreadConnectionIO):
         self.channels[channel_number] = ThreadConnectionChannel(self, channel_number)
         self.channels[channel_number].open()
         return self.channels[channel_number]
+
+    def deliver_pub_ack(self, frame_value):
+        if frame_value.channel_number not in self.channels:
+            LOGGER.critical("Received %s frame for unregistered channel %i on %s", frame_value.NAME,
+                            frame_value.channel_number, self)
+            return
+        self.channels[frame_value.channel_number].handle_pub_ack(frame_value)
 
     def deliver_frame(self, frame_value):
         if frame_value.channel_number == 0:

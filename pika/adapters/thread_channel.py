@@ -1,6 +1,10 @@
 # coding=utf-8
 import logging
 import uuid
+import thread
+
+import math
+from Queue import Queue
 
 from pika import spec, frame, exceptions
 from pika.adapters.thread_connection_io import ThreadConnectionIO
@@ -18,9 +22,12 @@ class ThreadConnectionChannel(ThreadConnectionIO):
         self.is_closed = False
         self._consumers = dict()
         self._consumers_with_noack = set()
+        self._delivery_confirmation = False
+        self._puback_return = None
+        self._puback_queue = Queue()
 
     def open(self):
-        self.rpc(self.channel_number, spec.Channel.Open(), [spec.Channel.OpenOk])
+        self.rpc(spec.Channel.Open(), [spec.Channel.OpenOk])
 
     def basic_ack(self, delivery_tag=0, multiple=False):
         self._validate_connection_and_channel()
@@ -35,7 +42,7 @@ class ThreadConnectionChannel(ThreadConnectionIO):
         LOGGER.debug('Cancelling consumer: %s (nowait=%s)',
                      consumer_tag, nowait)
         del self._consumers[consumer_tag]
-        return self.rpc(self.channel_number, spec.Basic.Cancel(consumer_tag=consumer_tag, nowait=nowait),
+        return self.rpc(spec.Basic.Cancel(consumer_tag=consumer_tag, nowait=nowait),
                         [(spec.Basic.CancelOk, {'consumer_tag': consumer_tag})] if nowait is False else [])
 
     def basic_consume(self, consumer_callback,
@@ -55,11 +62,11 @@ class ThreadConnectionChannel(ThreadConnectionIO):
             self._consumers_with_noack.add(consumer_tag)
 
         self._consumers[consumer_tag] = consumer_callback
-        self.rpc(self.channel_number, spec.Basic.Consume(queue=queue,
-                                                         consumer_tag=consumer_tag,
-                                                         no_ack=no_ack,
-                                                         exclusive=exclusive,
-                                                         arguments=arguments or dict()),
+        self.rpc(spec.Basic.Consume(queue=queue,
+                                    consumer_tag=consumer_tag,
+                                    no_ack=no_ack,
+                                    exclusive=exclusive,
+                                    arguments=arguments or dict()),
                  [(spec.Basic.ConsumeOk, {'consumer_tag': consumer_tag})])
 
         return consumer_tag
@@ -70,8 +77,7 @@ class ThreadConnectionChannel(ThreadConnectionIO):
 
     def basic_get(self, queue='', no_ack=False):
         self._validate_connection_and_channel()
-        get = self.rpc(self.channel_number, spec.Basic.Get(queue=queue, no_ack=no_ack),
-                       [spec.Basic.GetOk, spec.Basic.GetEmpty])
+        get = self.rpc(spec.Basic.Get(queue=queue, no_ack=no_ack), [spec.Basic.GetOk, spec.Basic.GetEmpty])
         if isinstance(spec.Basic.GetEmpty, get):
             return None
         else:
@@ -81,6 +87,48 @@ class ThreadConnectionChannel(ThreadConnectionIO):
         self._validate_connection_and_channel()
         return self.send_method(spec.Basic.Nack(delivery_tag, multiple,
                                                 requeue))
+
+    def publish(self, exchange, routing_key, body,
+                properties=None, mandatory=False, immediate=False):
+        if self._delivery_confirmation:
+            # In publisher-acknowledgments mode
+            self.basic_publish(exchange=exchange,
+                               routing_key=routing_key,
+                               body=body,
+                               properties=properties,
+                               mandatory=mandatory,
+                               immediate=immediate)
+            conf_method = self._puback_queue.get()
+            if isinstance(conf_method, spec.Basic.Nack):
+                # Broker was unable to process the message due to internal
+                # error
+                LOGGER.warn(
+                    "Message was Nack'ed by broker: nack=%r; channel=%s; "
+                    "exchange=%s; routing_key=%s; mandatory=%r; "
+                    "immediate=%r", conf_method, self.channel_number,
+                    exchange, routing_key, mandatory, immediate)
+                if self._puback_return is not None:
+                    returned_messages = [self._puback_return]
+                    self._puback_return = None
+                else:
+                    returned_messages = []
+                raise exceptions.NackError(returned_messages)
+            else:
+                assert isinstance(conf_method, spec.Basic.Ack), (conf_method)
+
+                if self._puback_return is not None:
+                    # Unroutable message was returned
+                    messages = [self._puback_return]
+                    self._puback_return = None
+                    raise exceptions.UnroutableError(messages)
+        else:
+            # In non-publisher-acknowledgments mode
+            self.basic_publish(exchange=exchange,
+                               routing_key=routing_key,
+                               body=body,
+                               properties=properties,
+                               mandatory=mandatory,
+                               immediate=immediate)
 
     def basic_publish(self, exchange, routing_key, body,
                       properties=None,
@@ -95,17 +143,15 @@ class ThreadConnectionChannel(ThreadConnectionIO):
         self.send_method(spec.Basic.Publish(exchange=exchange,
                                             routing_key=routing_key,
                                             mandatory=mandatory,
-                                            immediate=immediate))
-        # TODO write body
-        (properties, body)
+                                            immediate=immediate), (properties, body))
 
     def basic_qos(self,
                   prefetch_size=0,
                   prefetch_count=0,
                   all_channels=False):
         self._validate_connection_and_channel()
-        return self.rpc(self.channel_number, spec.Basic.Qos(prefetch_size, prefetch_count,
-                                                            all_channels),
+        return self.rpc(spec.Basic.Qos(prefetch_size, prefetch_count,
+                                       all_channels),
                         [spec.Basic.QosOk])
 
     def basic_reject(self, delivery_tag, requeue=True):
@@ -116,7 +162,7 @@ class ThreadConnectionChannel(ThreadConnectionIO):
 
     def basic_recover(self, requeue=False):
         self._validate_connection_and_channel()
-        return self.rpc(self.channel_number, spec.Basic.Recover(requeue), [spec.Basic.RecoverOk])
+        return self.rpc(spec.Basic.Recover(requeue), [spec.Basic.RecoverOk])
 
     def close(self, reply_code=0, reply_text="Normal Shutdown"):
         if self.is_closed:
@@ -135,16 +181,11 @@ class ThreadConnectionChannel(ThreadConnectionIO):
 
         if not (self.connection.publisher_confirms and self.connection.basic_nack):
             raise exceptions.MethodNotImplemented('Not Supported on Server')
-
+        self._delivery_confirmation = True
         return self.rpc(spec.Confirm.Select(nowait), [spec.Confirm.SelectOk] if nowait is False else [])
 
     @property
     def consumer_tags(self):
-        """Property method that returns a list of currently active consumers
-
-        :rtype: list
-
-        """
         return dictkeys(self._consumers)
 
     def exchange_bind(self,
@@ -154,8 +195,8 @@ class ThreadConnectionChannel(ThreadConnectionIO):
                       nowait=False,
                       arguments=None):
         self._validate_connection_and_channel()
-        return self.rpc(self.channel_number, spec.Exchange.Bind(0, destination, source, routing_key,
-                                                                nowait, arguments or dict()),
+        return self.rpc(spec.Exchange.Bind(0, destination, source, routing_key,
+                                           nowait, arguments or dict()),
                         [spec.Exchange.BindOk] if nowait is False
                         else [])
 
@@ -170,10 +211,10 @@ class ThreadConnectionChannel(ThreadConnectionIO):
                          arguments=None):
         self._validate_connection_and_channel()
 
-        return self.rpc(self.channel_number, spec.Exchange.Declare(0, exchange, exchange_type,
-                                                                   passive, durable, auto_delete,
-                                                                   internal, nowait,
-                                                                   arguments or dict()),
+        return self.rpc(spec.Exchange.Declare(0, exchange, exchange_type,
+                                              passive, durable, auto_delete,
+                                              internal, nowait,
+                                              arguments or dict()),
                         [spec.Exchange.DeclareOk] if nowait is False else [])
 
     def exchange_delete(self,
@@ -181,7 +222,7 @@ class ThreadConnectionChannel(ThreadConnectionIO):
                         if_unused=False,
                         nowait=False):
         self._validate_connection_and_channel()
-        return self.rpc(self.channel_number, spec.Exchange.Delete(0, exchange, if_unused, nowait),
+        return self.rpc(spec.Exchange.Delete(0, exchange, if_unused, nowait),
                         [spec.Exchange.DeleteOk] if nowait is False else [])
 
     def exchange_unbind(self,
@@ -199,6 +240,77 @@ class ThreadConnectionChannel(ThreadConnectionIO):
         self._validate_connection_and_channel()
         return self.rpc(spec.Channel.Flow(active), [spec.Channel.FlowOk])
 
+    def queue_bind(self, queue, exchange,
+                   routing_key=None,
+                   nowait=False,
+                   arguments=None):
+        self._validate_connection_and_channel()
+        replies = [spec.Queue.BindOk] if nowait is False else []
+        if routing_key is None:
+            routing_key = queue
+        return self.rpc(spec.Queue.Bind(0, queue, exchange, routing_key,
+                                        nowait, arguments or dict()), replies)
+
+    def queue_declare(self,
+                      queue='',
+                      passive=False,
+                      durable=False,
+                      exclusive=False,
+                      auto_delete=False,
+                      nowait=False,
+                      arguments=None):
+        if queue:
+            condition = (spec.Queue.DeclareOk,
+                         {'queue': queue})
+        else:
+            condition = spec.Queue.DeclareOk
+        replies = [condition] if nowait is False else []
+        self._validate_connection_and_channel()
+        return self.rpc(spec.Queue.Declare(0, queue, passive, durable,
+                                           exclusive, auto_delete, nowait,
+                                           arguments or dict()), replies)
+
+    def queue_delete(self,
+                     queue='',
+                     if_unused=False,
+                     if_empty=False,
+                     nowait=False):
+        replies = [spec.Queue.DeleteOk] if nowait is False else []
+        self._validate_connection_and_channel()
+        return self.rpc(spec.Queue.Delete(0, queue, if_unused, if_empty,
+                                          nowait), replies)
+
+    def queue_purge(self, queue='', nowait=False):
+        replies = [spec.Queue.PurgeOk] if nowait is False else []
+        self._validate_connection_and_channel()
+        return self.rpc(spec.Queue.Purge(0, queue, nowait), replies)
+
+    def queue_unbind(self,
+                     queue='',
+                     exchange=None,
+                     routing_key=None,
+                     arguments=None):
+        self._validate_connection_and_channel()
+        if routing_key is None:
+            routing_key = queue
+        return self.rpc(spec.Queue.Unbind(0, queue, exchange, routing_key,
+                                          arguments or dict()), [spec.Queue.UnbindOk])
+
+    def tx_commit(self):
+        self._validate_connection_and_channel()
+        return self.rpc(spec.Tx.Commit(), [spec.Tx.CommitOk])
+
+    def tx_rollback(self):
+        self._validate_connection_and_channel()
+        return self.rpc(spec.Tx.Rollback(), [spec.Tx.RollbackOk])
+
+    def tx_select(self):
+        self._validate_connection_and_channel()
+        return self.rpc(spec.Tx.Select(), [spec.Tx.SelectOk])
+
+    def handle_pub_ack(self, frame_value):
+        self._puback_queue.put(frame_value.method)
+
     def handle_frame(self, frame_value):
         finish, content = self._content_assembler.process(frame_value)
         if not finish:
@@ -212,39 +324,34 @@ class ThreadConnectionChannel(ThreadConnectionIO):
             return
 
         # TODO add consumer thread
-        self.deliver_to_consumer(*content)
+        thread.start_new_thread(self.deliver_to_consumer, content)
 
     def deliver_to_consumer(self, method_frame, header_frame, body):
-        print body
         if isinstance(method_frame.method, spec.Basic.Deliver):
             self._on_deliver(method_frame, header_frame, body)
-        elif isinstance(method_frame.method, spec.Basic.GetOk):
-            self._on_getok(method_frame, header_frame, body)
         elif isinstance(method_frame.method, spec.Basic.Return):
             self._on_return(method_frame, header_frame, body)
 
     def _on_deliver(self, method_frame, header_frame, body):
-        pass
+        consumer_tag = method_frame.method.consumer_tag
 
-    def _on_getok(self, method_frame, header_frame, body):
-        """Called in reply to a Basic.Get when there is a message.
-        :param pika.frame.Method method_frame: The Basic.Return frame
-        :param pika.frame.Header header_frame: The content header frame
-        :param body: The message body
-        :type body: str or unicode
-        """
-        pass
+        if consumer_tag not in self._consumers:
+            LOGGER.warn('Unexpected delivery: %r', method_frame)
+            self.basic_reject(method_frame.method.delivery_tag)
+            return
+
+        self._consumers[consumer_tag](self, method_frame.method, header_frame.properties, body)
 
     def _on_return(self, method_frame, header_frame, body):
-        """Called if the server sends a Basic.Return frame.
-
-        :param pika.frame.Method method_frame: The Basic.Return frame
-        :param pika.frame.Header header_frame: The content header frame
-        :param body: The message body
-        :type body: str or unicode
-
-        """
-        pass
+        assert isinstance(method_frame, spec.Basic.Return), method_frame
+        assert isinstance(method_frame.properties, spec.BasicProperties), method_frame.properties
+        LOGGER.warn(
+            "Published message was returned: _delivery_confirmation=%s; "
+            "channel=%s; method=%r; properties=%r; body_size=%d; "
+            "body_prefix=%.255r", self._delivery_confirmation,
+            self.channel_number, method_frame, method_frame.properties,
+            len(body) if body is not None else None, body)
+        self._puback_return = (method_frame, header_frame, body)
 
     def _validate_connection_and_channel(self):
         if self.connection.is_closed():
@@ -252,8 +359,28 @@ class ThreadConnectionChannel(ThreadConnectionIO):
         if self.is_closed:
             raise exceptions.ChannelClosed()
 
-    def send_method(self, method):
-        self.connection.send_method(self.channel_number, method)
+    def send_method(self, method, content=None):
+        if content is None:
+            self.connection.send_method(self.channel_number, method)
+        else:
+            self._send_message(self.channel_number, method, content)
+
+    def _send_message(self, channel_number, method, content=None):
+        length = len(content[1])
+        self.connection.send_frame(frame.Method(channel_number, method).marshal())
+        self.connection.send_frame(frame.Header(channel_number, length, content[0]))
+        if content[1]:
+            body_max_length = (self.connection.frame_max - spec.FRAME_HEADER_SIZE - spec.FRAME_END_SIZE)
+            chunks = int(math.ceil(float(length) / body_max_length))
+            for chunk in xrange(0, chunks):
+                start = chunk * body_max_length
+                end = start + body_max_length
+                if end > length:
+                    end = length
+                self.connection.send_frame(frame.Body(channel_number, content[1][start:end]))
+
+    def rpc(self, method, acceptable_replies=None):
+        return self.rpc0(self.channel_number, method, acceptable_replies)
 
 
 class ContentFrameAssembler(object):
@@ -281,6 +408,7 @@ class ContentFrameAssembler(object):
             self._header_frame = frame_value
             if frame_value.body_size == 0:
                 return self._finish()
+            return False, None
         elif isinstance(frame_value, frame.Body):
             return self._handle_body_frame(frame_value)
         else:
