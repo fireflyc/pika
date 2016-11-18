@@ -316,11 +316,11 @@ class ThreadConnectionChannel(ThreadConnectionIO):
         if not finish:
             return
         if not isinstance(content, tuple):
-            self.queue.put(content.method)
+            ThreadConnectionIO.handle_frame(self, frame_value)
             return
         (method_frame, header_frame, body) = content
         if isinstance(method_frame, spec.Basic.GetOk):
-            self.queue.put(content)
+            ThreadConnectionIO.handle_frame(self, frame_value)
             return
 
         # TODO add consumer thread
